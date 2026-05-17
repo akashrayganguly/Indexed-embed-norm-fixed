@@ -1,29 +1,51 @@
+"""
+models/decoder.py
+
+NO CHANGES vs latest repo.
+
+Explanation of why no changes are needed:
+
+DecoderLayer takes pre-constructed self_attention and cross_attention objects
+as constructor arguments. The channel_period is baked into these attention
+objects at construction time in model.py (where Attn(..., channel_period=cp)
+is called). DecoderLayer itself does not construct any masks — mask construction
+happens inside FullAttention and ProbAttention when their forward() is called.
+
+The channel mixing matrix W, norm layers, FFN convolutions, and the residual
+connection structure are all independent of channel_period.
+
+The Decoder class simply chains DecoderLayer instances and applies a final
+norm — also no changes needed.
+
+This file is provided in full so the repo is complete and self-consistent.
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 
 class DecoderLayer(nn.Module):
     def __init__(self, self_attention, cross_attention, d_model, d_ff=None,
                  dropout=0.1, activation="relu", channel_mix_size=None):
         super(DecoderLayer, self).__init__()
-        d_ff = d_ff or 4*d_model
+        d_ff = d_ff or 4 * d_model
         self.self_attention = self_attention
         self.cross_attention = cross_attention
-        self.conv1 = nn.Conv1d(in_channels=d_model, out_channels=d_ff, kernel_size=1)
-        self.conv2 = nn.Conv1d(in_channels=d_ff, out_channels=d_model, kernel_size=1)
+        self.conv1 = nn.Conv1d(
+            in_channels=d_model, out_channels=d_ff, kernel_size=1)
+        self.conv2 = nn.Conv1d(
+            in_channels=d_ff, out_channels=d_model, kernel_size=1)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.norm3 = nn.LayerNorm(d_model)
-        
         self.dropout = nn.Dropout(dropout)
         self.activation = F.relu if activation == "relu" else F.gelu
 
-        # ---------- channel-mixing extension ----------
+        # Channel-mixing extension (unchanged)
         self.channel_mix_size = channel_mix_size
         if channel_mix_size is not None and channel_mix_size > 0:
             self.norm4 = nn.LayerNorm(d_model)
-            # nn.Parameter works correctly under FSDP when
-            # use_orig_params=True is set in the FSDP constructor.
             self.W = nn.Parameter(torch.empty(channel_mix_size, channel_mix_size))
             nn.init.xavier_uniform_(self.W)
         else:
@@ -31,26 +53,26 @@ class DecoderLayer(nn.Module):
             self.W = None
 
     def forward(self, x, cross, x_mask=None, cross_mask=None):
+        # Decoder self-attention (causal, mask_flag=True)
+        # BlockTriangularCausalMask is constructed inside self_attention.forward()
+        # when x_mask is None, using the channel_period stored in the attention
+        # module at construction time in model.py.
         x = x + self.dropout(self.self_attention(
-            x, x, x,
-            attn_mask=x_mask
+            x, x, x, attn_mask=x_mask
         )[0])
         x = self.norm1(x)
 
+        # Cross-attention (mask_flag=False, no causal mask applied)
         x = x + self.dropout(self.cross_attention(
-            x, cross, cross,
-            attn_mask=cross_mask
+            x, cross, cross, attn_mask=cross_mask
         )[0])
 
         y = x = self.norm2(x)
         y = self.dropout(self.activation(self.conv1(y.transpose(-1, 1))))
         y = self.dropout(self.conv2(y).transpose(-1, 1))
-        
         x = self.norm3(x + y)
-        #return self.norm3(x+y)
 
-
-        # ---- channel mixing (optional) ----
+        # Channel mixing (optional, unchanged)
         if self.W is not None:
             batch_size, seq_len, d_model = x.shape
             c = self.channel_mix_size
@@ -64,21 +86,11 @@ class DecoderLayer(nn.Module):
                 )
 
             n = seq_len // c
-
-            # Reshape: [B, n, c, D]
             x_reshaped = x.view(batch_size, n, c, d_model)
-
-            # Ensure matching dtypes under mixed-precision.
-            # FSDP casts self.W to param_dtype; x may still be fp32
-            # from LayerNorm.  Cast x to match W.
             W = self.W
             if x_reshaped.dtype != W.dtype:
                 x_reshaped = x_reshaped.to(W.dtype)
-
-            # Apply W group-wise: [c, c] × [B, n, c, D] → [B, n, c, D]
             x_transformed = torch.einsum('ij,bnjd->bnid', W, x_reshaped)
-
-            # Reshape back: [B, L_dec, D]
             x = x_transformed.reshape(batch_size, seq_len, d_model)
             x = self.dropout(x)
             x = self.norm4(x)
@@ -87,6 +99,7 @@ class DecoderLayer(nn.Module):
 
 
 class Decoder(nn.Module):
+    """Unchanged from latest repo."""
     def __init__(self, layers, norm_layer=None):
         super(Decoder, self).__init__()
         self.layers = nn.ModuleList(layers)
@@ -95,8 +108,6 @@ class Decoder(nn.Module):
     def forward(self, x, cross, x_mask=None, cross_mask=None):
         for layer in self.layers:
             x = layer(x, cross, x_mask=x_mask, cross_mask=cross_mask)
-
         if self.norm is not None:
             x = self.norm(x)
-
         return x
