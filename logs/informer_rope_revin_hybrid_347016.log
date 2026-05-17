@@ -1,0 +1,406 @@
+==========================================================================
+    INFORMER ROPE-RevIN FSDP TRAINING WITH HYBRID_SHARD
+    Automatically scales with number of nodes
+==========================================================================
+Job ID: 347016
+Start time: Sun May 17 09:24:16 IST 2026
+==========================================================================
+
+Cluster Configuration (Auto-Detected):
+  - Nodes: 2
+  - GPUs per node: 2
+  - Total GPUs (world_size): 4
+  - CPUs per task: 8
+  - Memory per node: 65536
+
+HYBRID_SHARD Configuration:
+  - Sharding: Within each node (2 GPUs, fast NVLink)
+  - Replication: Across 2 nodes (gradient sync only)
+  - Expected benefit: ~2x less inter-node param communication
+==========================================================================
+
+Allocated nodes:
+     1	cn81
+     2	cn82
+==========================================================================
+
+Environment Variables:
+  - MASTER_ADDR: cn81
+  - MASTER_PORT: 29504
+  - WORLD_SIZE: 4
+  - OMP_NUM_THREADS: 4
+  - NCCL_P2P_LEVEL: NVL
+==========================================================================
+Working directory: /home/akashg/time-series/python-files/Informer-indexed-v5
+Setting up Python environment...
+Activating informerworking environment...
+Python Configuration:
+  - Conda environment: informerworking
+  - Python: /home/akashg/miniconda3/envs/informerworking/bin/python
+  - Python version: Python 3.10.16
+  - PyTorch version: 2.6.0+cu124
+  - CUDA available: True
+  - CUDA version: 12.4
+  - cuDNN version: 90100
+  - GPUs visible: 2
+  - BF16 supported: True
+  - torchrun: /home/akashg/miniconda3/envs/informerworking/bin/torchrun
+==========================================================================
+GPU Hardware Information on cn81:
+index, name, driver_version, memory.total [MiB], memory.free [MiB], compute_cap
+0, NVIDIA A100 80GB PCIe, 580.95.05, 81920 MiB, 81153 MiB, 8.0
+1, NVIDIA A100 80GB PCIe, 580.95.05, 81920 MiB, 81153 MiB, 8.0
+==========================================================================
+GPU Topology on cn81:
+	[4mGPU0	GPU1	NIC0	CPU Affinity	NUMA Affinity	GPU NUMA ID[0m
+GPU0	 X 	NODE	NODE	0-7	0		N/A
+GPU1	NODE	 X 	NODE		1		N/A
+NIC0	NODE	NODE	 X 				
+
+Legend:
+
+  X    = Self
+  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)
+  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node
+  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)
+  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)
+  PIX  = Connection traversing at most a single PCIe bridge
+  NV#  = Connection traversing a bonded set of # NVLinks
+
+NIC Legend:
+
+  NIC0: mlx5_0
+
+==========================================================================
+Testing inter-node connectivity...
+Node cn81 reachable (Node rank: 0)
+Node cn82 reachable (Node rank: 1)
+==========================================================================
+
+Verifying required files...
+  OK: main_informer_vanillarope_revin_hybridfsdp.py
+  OK: VanillaInformerROPE-Revin-hybridfsdp/exp/exp_informer.py
+  OK: VanillaInformerROPE-Revin-hybridfsdp/exp/exp_basic.py
+  OK: VanillaInformerROPE-Revin-hybridfsdp/data/data_loader.py
+  OK: VanillaInformerROPE-Revin-hybridfsdp/models/model.py
+  OK: VanillaInformerROPE-Revin-hybridfsdp/models/attn.py
+  OK: VanillaInformerROPE-Revin-hybridfsdp/models/encoder.py
+  OK: VanillaInformerROPE-Revin-hybridfsdp/models/decoder.py
+  OK: VanillaInformerROPE-Revin-hybridfsdp/models/embed.py
+  OK: VanillaInformerROPE-Revin-hybridfsdp/utils/tools.py
+  OK: VanillaInformerROPE-Revin-hybridfsdp/utils/RevIN.py
+  OK: VanillaInformerROPE-Revin-hybridfsdp/utils/masking.py
+  OK: VanillaInformerROPE-Revin-hybridfsdp/utils/metrics.py
+  OK: VanillaInformerROPE-Revin-hybridfsdp/utils/timefeatures.py
+==========================================================================
+Launching FSDP Training with torchrun...
+Configuration Summary:
+  - Nodes: 2
+  - GPUs per node: 2
+  - Total GPUs: 4
+  - Launcher: torchrun --nproc_per_node=2
+  - Master: cn81:29504
+  - Training script: main_informer_vanillarope_revin_hybridfsdp.py
+  - FSDP Strategy: HYBRID_SHARD
+  - Model: Informer + ROPE + RevIN
+==========================================================================
+Training start: Sun May 17 09:24:40 IST 2026
+==========================================================================
+[Node cn82, rank 1] Starting torchrun with 2 GPUs
+[Node cn81, rank 0] Starting torchrun with 2 GPUs
+
+============================================================
+DISTRIBUTED: 2 nodes x 2 GPUs = 4 total
+============================================================
+
+
+============================================================
+CONFIGURATION
+============================================================
+Distributed: 2 nodes x 2 GPUs
+Batch: 8 x 1 accum x 4 = 32
+Strategy: HYBRID_SHARD
+Data loading: 6 workers, prefetch=4, CUDA prefetch=True
+Sequences: enc=672, dec=336+1344=1680, pred=1344
+max_len: 2520  (1.5 x max_seq=1680)
+c_out: 1  enc_in: 9
+RevIN: True
+Channel Period: 7  Channel Mix Size: 7
+Optimizer: AdamW (lr=0.0004, weight_decay=0.02)
+LR Schedule: cosine (warmup_ratio=0.05)
+Dropout: 0.08  Patience: 5  Epochs: 25
+============================================================
+
+
+>>> Starting: informer_custom_hybrid_optimized_0
+FSDP Mode - Using device: cuda:0
+Model Parameters: 13,924,006 total, 13,924,006 trainable
+
+Wrapping model with FSDP...
+
+============================================================
+HYBRID SHARDING SETUP
+  World: 4, Nodes: 2, GPUs/node: 2
+============================================================
+  DeviceMesh created: (2, 2)
+  Sharding Strategy: HYBRID_SHARD
+  Mixed Precision: BF16
+
+============================================================
+EXPERIMENT CONFIGURATION
+============================================================
+  Model: informer
+  Data: custom
+  Seq/Label/Pred: 672/336/1344
+  d_model: 512, n_heads: 8
+  E-layers: 2, D-layers: 1
+  FSDP: True
+  Sharding Strategy: HYBRID_SHARD
+  World Size: 4
+  AMP: BF16
+  Channel Period: 7
+  Stride: 1 (overlapping)
+  Use RevIN (per-channel): True
+  Per-channel StandardScaler: True
+  Device: cuda:0
+============================================================
+
+train dataset: 82872 samples (stride=1)
+val dataset: 10785 samples (stride=1)
+test dataset: 22910 samples (stride=1)
+NCCL version 2.21.5+cuda12.4
+  AdamW param groups: 6,951,760 decay, 10,240 no-decay
+NCCL version 2.21.5+cuda12.4
+NCCL version 2.21.5+cuda12.4
+  Epoch 1 | Iter 100/2589 | Loss: 0.781250 | LR: 1.27e-05 | Speed: 0.13s/iter | ETA: 326s
+    Timing: Data:1% Fwd:38% Bwd:57% Opt:4%
+  Epoch 1 | Iter 200/2589 | Loss: 1.039062 | LR: 2.51e-05 | Speed: 0.11s/iter | ETA: 275s
+    Timing: Data:1% Fwd:34% Bwd:61% Opt:4%
+  Epoch 1 | Iter 300/2589 | Loss: 1.031250 | LR: 3.74e-05 | Speed: 0.11s/iter | ETA: 251s
+    Timing: Data:1% Fwd:33% Bwd:63% Opt:4%
+  Epoch 1 | Iter 400/2589 | Loss: 0.875000 | LR: 4.98e-05 | Speed: 0.11s/iter | ETA: 234s
+    Timing: Data:1% Fwd:32% Bwd:64% Opt:4%
+  Epoch 1 | Iter 500/2589 | Loss: 0.886719 | LR: 6.21e-05 | Speed: 0.11s/iter | ETA: 220s
+    Timing: Data:1% Fwd:31% Bwd:65% Opt:4%
+  Epoch 1 | Iter 600/2589 | Loss: 0.863281 | LR: 7.45e-05 | Speed: 0.10s/iter | ETA: 207s
+    Timing: Data:1% Fwd:31% Bwd:65% Opt:4%
+  Epoch 1 | Iter 700/2589 | Loss: 1.109375 | LR: 8.68e-05 | Speed: 0.10s/iter | ETA: 195s
+    Timing: Data:0% Fwd:31% Bwd:65% Opt:4%
+  Epoch 1 | Iter 800/2589 | Loss: 0.933594 | LR: 9.92e-05 | Speed: 0.10s/iter | ETA: 184s
+    Timing: Data:0% Fwd:30% Bwd:65% Opt:4%
+  Epoch 1 | Iter 900/2589 | Loss: 1.015625 | LR: 1.12e-04 | Speed: 0.10s/iter | ETA: 173s
+    Timing: Data:0% Fwd:30% Bwd:66% Opt:4%
+  Epoch 1 | Iter 1000/2589 | Loss: 1.000000 | LR: 1.24e-04 | Speed: 0.10s/iter | ETA: 162s
+    Timing: Data:0% Fwd:30% Bwd:66% Opt:4%
+  Epoch 1 | Iter 1100/2589 | Loss: 0.757812 | LR: 1.36e-04 | Speed: 0.10s/iter | ETA: 151s
+    Timing: Data:0% Fwd:30% Bwd:66% Opt:4%
+  Epoch 1 | Iter 1200/2589 | Loss: 0.835938 | LR: 1.49e-04 | Speed: 0.10s/iter | ETA: 141s
+    Timing: Data:0% Fwd:30% Bwd:66% Opt:4%
+  Epoch 1 | Iter 1300/2589 | Loss: 1.023438 | LR: 1.61e-04 | Speed: 0.10s/iter | ETA: 130s
+    Timing: Data:0% Fwd:30% Bwd:66% Opt:4%
+  Epoch 1 | Iter 1400/2589 | Loss: 0.710938 | LR: 1.73e-04 | Speed: 0.10s/iter | ETA: 120s
+    Timing: Data:0% Fwd:30% Bwd:66% Opt:4%
+  Epoch 1 | Iter 1500/2589 | Loss: 0.757812 | LR: 1.86e-04 | Speed: 0.10s/iter | ETA: 110s
+    Timing: Data:0% Fwd:30% Bwd:66% Opt:4%
+  Epoch 1 | Iter 1600/2589 | Loss: 0.664062 | LR: 1.98e-04 | Speed: 0.10s/iter | ETA: 100s
+    Timing: Data:0% Fwd:30% Bwd:66% Opt:4%
+  Epoch 1 | Iter 1700/2589 | Loss: 1.164062 | LR: 2.10e-04 | Speed: 0.10s/iter | ETA: 89s
+    Timing: Data:0% Fwd:30% Bwd:66% Opt:4%
+  Epoch 1 | Iter 1800/2589 | Loss: 0.812500 | LR: 2.23e-04 | Speed: 0.10s/iter | ETA: 79s
+    Timing: Data:0% Fwd:30% Bwd:66% Opt:4%
+  Epoch 1 | Iter 1900/2589 | Loss: 0.746094 | LR: 2.35e-04 | Speed: 0.10s/iter | ETA: 69s
+    Timing: Data:0% Fwd:30% Bwd:66% Opt:4%
+  Epoch 1 | Iter 2000/2589 | Loss: 0.640625 | LR: 2.47e-04 | Speed: 0.10s/iter | ETA: 59s
+    Timing: Data:0% Fwd:30% Bwd:66% Opt:4%
+  Epoch 1 | Iter 2100/2589 | Loss: 1.148438 | LR: 2.60e-04 | Speed: 0.10s/iter | ETA: 49s
+    Timing: Data:0% Fwd:30% Bwd:66% Opt:4%
+  Epoch 1 | Iter 2200/2589 | Loss: 0.648438 | LR: 2.72e-04 | Speed: 0.10s/iter | ETA: 39s
+    Timing: Data:0% Fwd:29% Bwd:66% Opt:4%
+  Epoch 1 | Iter 2300/2589 | Loss: 0.855469 | LR: 2.84e-04 | Speed: 0.10s/iter | ETA: 29s
+    Timing: Data:0% Fwd:29% Bwd:66% Opt:4%
+  Epoch 1 | Iter 2400/2589 | Loss: 1.226562 | LR: 2.97e-04 | Speed: 0.10s/iter | ETA: 19s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 1 | Iter 2500/2589 | Loss: 0.937500 | LR: 3.09e-04 | Speed: 0.10s/iter | ETA: 9s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+
+  Epoch 1 Complete | Time: 258s
+    Train Loss (1st elem): 0.8863110
+    Train Loss (full vec): 0.8863110
+    Vali Loss:  0.5948425
+    Test Loss:  0.9184830
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+
+  Test loss improved --> 0.9184830 (epoch 1). Saving test-best model...
+Validation loss decreased (inf --> 0.594842).  Saving model ...
+    Current LR: 3.20e-04
+  Epoch 2 | Iter 100/2589 | Loss: 1.093750 | LR: 3.32e-04 | Speed: 0.10s/iter | ETA: 247s
+    Timing: Data:1% Fwd:29% Bwd:67% Opt:4%
+  Epoch 2 | Iter 200/2589 | Loss: 0.792969 | LR: 3.45e-04 | Speed: 0.10s/iter | ETA: 236s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 2 | Iter 300/2589 | Loss: 0.625000 | LR: 3.57e-04 | Speed: 0.10s/iter | ETA: 226s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 2 | Iter 400/2589 | Loss: 0.695312 | LR: 3.69e-04 | Speed: 0.10s/iter | ETA: 216s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 2 | Iter 500/2589 | Loss: 1.273438 | LR: 3.82e-04 | Speed: 0.10s/iter | ETA: 206s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 2 | Iter 600/2589 | Loss: 0.628906 | LR: 3.94e-04 | Speed: 0.10s/iter | ETA: 196s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 2 | Iter 700/2589 | Loss: 0.765625 | LR: 4.00e-04 | Speed: 0.10s/iter | ETA: 186s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 2 | Iter 800/2589 | Loss: 1.062500 | LR: 4.00e-04 | Speed: 0.10s/iter | ETA: 177s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 2 | Iter 900/2589 | Loss: 0.863281 | LR: 4.00e-04 | Speed: 0.10s/iter | ETA: 167s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 2 | Iter 1000/2589 | Loss: 0.625000 | LR: 4.00e-04 | Speed: 0.10s/iter | ETA: 157s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 2 | Iter 1100/2589 | Loss: 0.851562 | LR: 4.00e-04 | Speed: 0.10s/iter | ETA: 147s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 2 | Iter 1200/2589 | Loss: 0.671875 | LR: 4.00e-04 | Speed: 0.10s/iter | ETA: 137s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 2 | Iter 1300/2589 | Loss: 0.781250 | LR: 4.00e-04 | Speed: 0.10s/iter | ETA: 127s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 2 | Iter 1400/2589 | Loss: 1.070312 | LR: 4.00e-04 | Speed: 0.10s/iter | ETA: 117s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 2 | Iter 1500/2589 | Loss: 0.976562 | LR: 4.00e-04 | Speed: 0.10s/iter | ETA: 107s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 2 | Iter 1600/2589 | Loss: 0.660156 | LR: 4.00e-04 | Speed: 0.10s/iter | ETA: 98s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 2 | Iter 1700/2589 | Loss: 0.582031 | LR: 4.00e-04 | Speed: 0.10s/iter | ETA: 88s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 2 | Iter 1800/2589 | Loss: 0.765625 | LR: 4.00e-04 | Speed: 0.10s/iter | ETA: 78s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 2 | Iter 1900/2589 | Loss: 0.878906 | LR: 4.00e-04 | Speed: 0.10s/iter | ETA: 68s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 2 | Iter 2000/2589 | Loss: 0.832031 | LR: 4.00e-04 | Speed: 0.10s/iter | ETA: 58s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 2 | Iter 2100/2589 | Loss: 0.644531 | LR: 3.99e-04 | Speed: 0.10s/iter | ETA: 48s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 2 | Iter 2200/2589 | Loss: 0.738281 | LR: 3.99e-04 | Speed: 0.10s/iter | ETA: 38s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 2 | Iter 2300/2589 | Loss: 0.707031 | LR: 3.99e-04 | Speed: 0.10s/iter | ETA: 29s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 2 | Iter 2400/2589 | Loss: 0.609375 | LR: 3.99e-04 | Speed: 0.10s/iter | ETA: 19s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 2 | Iter 2500/2589 | Loss: 0.515625 | LR: 3.99e-04 | Speed: 0.10s/iter | ETA: 9s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+
+  Epoch 2 Complete | Time: 255s
+    Train Loss (1st elem): 0.7687797
+    Train Loss (full vec): 0.7687797
+    Vali Loss:  0.5021183
+    Test Loss:  0.6900275
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+
+  Test loss improved --> 0.6900275 (epoch 2). Saving test-best model...
+Validation loss decreased (0.594842 --> 0.502118).  Saving model ...
+    Current LR: 3.99e-04
+  Epoch 3 | Iter 100/2589 | Loss: 0.703125 | LR: 3.99e-04 | Speed: 0.10s/iter | ETA: 247s
+    Timing: Data:1% Fwd:29% Bwd:67% Opt:4%
+  Epoch 3 | Iter 200/2589 | Loss: 0.832031 | LR: 3.99e-04 | Speed: 0.10s/iter | ETA: 237s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 3 | Iter 300/2589 | Loss: 0.773438 | LR: 3.99e-04 | Speed: 0.10s/iter | ETA: 226s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 3 | Iter 400/2589 | Loss: 0.691406 | LR: 3.99e-04 | Speed: 0.10s/iter | ETA: 216s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 3 | Iter 500/2589 | Loss: 0.667969 | LR: 3.98e-04 | Speed: 0.10s/iter | ETA: 206s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 3 | Iter 600/2589 | Loss: 0.511719 | LR: 3.98e-04 | Speed: 0.10s/iter | ETA: 196s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 3 | Iter 700/2589 | Loss: 0.722656 | LR: 3.98e-04 | Speed: 0.10s/iter | ETA: 186s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 3 | Iter 800/2589 | Loss: 0.843750 | LR: 3.98e-04 | Speed: 0.10s/iter | ETA: 176s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 3 | Iter 900/2589 | Loss: 0.941406 | LR: 3.98e-04 | Speed: 0.10s/iter | ETA: 167s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 3 | Iter 1000/2589 | Loss: 0.773438 | LR: 3.98e-04 | Speed: 0.10s/iter | ETA: 157s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 3 | Iter 1100/2589 | Loss: 0.601562 | LR: 3.98e-04 | Speed: 0.10s/iter | ETA: 147s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 3 | Iter 1200/2589 | Loss: 0.687500 | LR: 3.97e-04 | Speed: 0.10s/iter | ETA: 137s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 3 | Iter 1300/2589 | Loss: 0.972656 | LR: 3.97e-04 | Speed: 0.10s/iter | ETA: 127s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 3 | Iter 1400/2589 | Loss: 0.785156 | LR: 3.97e-04 | Speed: 0.10s/iter | ETA: 117s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 3 | Iter 1500/2589 | Loss: 0.531250 | LR: 3.97e-04 | Speed: 0.10s/iter | ETA: 107s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 3 | Iter 1600/2589 | Loss: 0.750000 | LR: 3.97e-04 | Speed: 0.10s/iter | ETA: 98s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 3 | Iter 1700/2589 | Loss: 0.628906 | LR: 3.97e-04 | Speed: 0.10s/iter | ETA: 88s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 3 | Iter 1800/2589 | Loss: 0.578125 | LR: 3.96e-04 | Speed: 0.10s/iter | ETA: 78s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 3 | Iter 1900/2589 | Loss: 0.722656 | LR: 3.96e-04 | Speed: 0.10s/iter | ETA: 68s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 3 | Iter 2000/2589 | Loss: 0.777344 | LR: 3.96e-04 | Speed: 0.10s/iter | ETA: 58s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 3 | Iter 2100/2589 | Loss: 0.785156 | LR: 3.96e-04 | Speed: 0.10s/iter | ETA: 48s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 3 | Iter 2200/2589 | Loss: 0.640625 | LR: 3.96e-04 | Speed: 0.10s/iter | ETA: 38s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 3 | Iter 2300/2589 | Loss: 0.941406 | LR: 3.95e-04 | Speed: 0.10s/iter | ETA: 28s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 3 | Iter 2400/2589 | Loss: 0.765625 | LR: 3.95e-04 | Speed: 0.10s/iter | ETA: 19s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 3 | Iter 2500/2589 | Loss: 0.625000 | LR: 3.95e-04 | Speed: 0.10s/iter | ETA: 9s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+
+  Epoch 3 Complete | Time: 255s
+    Train Loss (1st elem): 0.7226090
+    Train Loss (full vec): 0.7226090
+    Vali Loss:  0.5157250
+    Test Loss:  0.6964304
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+
+EarlyStopping counter: 1 out of 5
+    Current LR: 3.95e-04
+  Epoch 4 | Iter 100/2589 | Loss: 0.847656 | LR: 3.94e-04 | Speed: 0.10s/iter | ETA: 247s
+    Timing: Data:1% Fwd:29% Bwd:67% Opt:4%
+  Epoch 4 | Iter 200/2589 | Loss: 0.988281 | LR: 3.94e-04 | Speed: 0.10s/iter | ETA: 236s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 4 | Iter 300/2589 | Loss: 0.636719 | LR: 3.94e-04 | Speed: 0.10s/iter | ETA: 226s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 4 | Iter 400/2589 | Loss: 0.542969 | LR: 3.94e-04 | Speed: 0.10s/iter | ETA: 216s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 4 | Iter 500/2589 | Loss: 0.585938 | LR: 3.93e-04 | Speed: 0.10s/iter | ETA: 206s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 4 | Iter 600/2589 | Loss: 0.742188 | LR: 3.93e-04 | Speed: 0.10s/iter | ETA: 196s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 4 | Iter 700/2589 | Loss: 0.632812 | LR: 3.93e-04 | Speed: 0.10s/iter | ETA: 186s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 4 | Iter 800/2589 | Loss: 0.914062 | LR: 3.93e-04 | Speed: 0.10s/iter | ETA: 176s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 4 | Iter 900/2589 | Loss: 0.632812 | LR: 3.92e-04 | Speed: 0.10s/iter | ETA: 166s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 4 | Iter 1000/2589 | Loss: 0.644531 | LR: 3.92e-04 | Speed: 0.10s/iter | ETA: 157s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 4 | Iter 1100/2589 | Loss: 0.482422 | LR: 3.92e-04 | Speed: 0.10s/iter | ETA: 147s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 4 | Iter 1200/2589 | Loss: 0.867188 | LR: 3.92e-04 | Speed: 0.10s/iter | ETA: 137s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 4 | Iter 1300/2589 | Loss: 1.117188 | LR: 3.91e-04 | Speed: 0.10s/iter | ETA: 127s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 4 | Iter 1400/2589 | Loss: 1.125000 | LR: 3.91e-04 | Speed: 0.10s/iter | ETA: 117s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 4 | Iter 1500/2589 | Loss: 0.539062 | LR: 3.91e-04 | Speed: 0.10s/iter | ETA: 107s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 4 | Iter 1600/2589 | Loss: 0.562500 | LR: 3.90e-04 | Speed: 0.10s/iter | ETA: 97s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 4 | Iter 1700/2589 | Loss: 0.636719 | LR: 3.90e-04 | Speed: 0.10s/iter | ETA: 88s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 4 | Iter 1800/2589 | Loss: 0.636719 | LR: 3.90e-04 | Speed: 0.10s/iter | ETA: 78s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 4 | Iter 1900/2589 | Loss: 0.613281 | LR: 3.89e-04 | Speed: 0.10s/iter | ETA: 68s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 4 | Iter 2000/2589 | Loss: 0.609375 | LR: 3.89e-04 | Speed: 0.10s/iter | ETA: 58s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 4 | Iter 2100/2589 | Loss: 0.738281 | LR: 3.89e-04 | Speed: 0.10s/iter | ETA: 48s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 4 | Iter 2200/2589 | Loss: 0.613281 | LR: 3.88e-04 | Speed: 0.10s/iter | ETA: 38s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 4 | Iter 2300/2589 | Loss: 0.820312 | LR: 3.88e-04 | Speed: 0.10s/iter | ETA: 28s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 4 | Iter 2400/2589 | Loss: 0.812500 | LR: 3.88e-04 | Speed: 0.10s/iter | ETA: 19s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
+  Epoch 4 | Iter 2500/2589 | Loss: 0.609375 | LR: 3.87e-04 | Speed: 0.10s/iter | ETA: 9s
+    Timing: Data:0% Fwd:29% Bwd:67% Opt:4%
