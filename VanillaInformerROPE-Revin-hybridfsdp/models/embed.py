@@ -1,38 +1,41 @@
 """
-embed.py - ROPE Embeddings with Per-Sample Channel Phase Correction
-             and Timestep-Granularity Positional Embeddings
+models/embed.py
 
-FIXES vs previous version:
+CHANGE vs latest repo (TokenEmbedding only — everything else unchanged):
 
-FIX 1 (channel phase — from previous round):
-    RotaryChannelEmbeddingLearnable and RotaryChannelEmbeddingFixed accept a
-    per-sample phase_offset so that position j of sample b gets the channel
-    embedding for (phase_offset[b] + j) % channel_period rather than always
-    starting from channel 0.
+TokenEmbedding: kernel_size=3, padding=1, padding_mode='circular'
+             -> kernel_size=1, padding=0
 
-FIX 2 (positional embedding granularity — this round):
-    RotaryPositionalEmbedding and RotaryPositionalEmbeddingFixed previously
-    looked up table row j for window position j, giving every row in the
-    (N*c, m+1) data a unique positional embedding. This was wrong: in the
-    restructured data, channel_period consecutive rows all belong to the same
-    real timestep and should receive the same positional embedding.
+REASON:
+    In the (N*channel_period, m+1) restructured format, adjacent sequence
+    positions j and j+1 are different channels (or a channel-boundary crossing
+    into the next timestep). A Conv1d with kernel_size=3 therefore mixes three
+    consecutive positions that may represent three different channels spanning
+    two different timesteps. The circular padding made this worse: position 0
+    received a contribution from position seq_len-1 (last channel of the last
+    timestep → first channel of the first timestep), mixing temporally and
+    channel-wise distant information at the very first token.
 
-    FIX: look up table row j // channel_period instead of j.
-    - Positions 0..c-1   → timestep 0 embedding  (all identical) ✓
-    - Positions c..2c-1  → timestep 1 embedding  (all identical) ✓
-    - etc.
+    kernel_size=1 is a pointwise independent linear projection per position:
+        embedding[j] = W @ x[j] + b
+    Each position's d_model representation is derived exclusively from its
+    own (m+1)-dimensional feature vector. No neighbourhood mixing occurs.
+    All cross-position interactions — both temporal (same channel, different
+    timesteps) and cross-channel (same timestep, different channels) — are
+    then handled exclusively by the attention mechanism and the channel mixing
+    matrix W, which is the architecturally principled place for them.
 
-    channel_period is now a constructor argument for both positional embedding
-    classes. DataEmbedding already had self.channel_period and now forwards it.
+    The Kaiming initialisation loop is unchanged and applies correctly to
+    kernel_size=1 Conv1d weights.
 
-    max_len is unchanged — the maximum lookup index after the fix is
-    (seq_len-1) // channel_period which is always smaller than seq_len,
-    so any table that was large enough before is still large enough.
-    The max_len guard is updated to check the actual maximum index rather
-    than seq_len to avoid false-positive errors.
+    When channel_period=1 (ETT standard format): positions are already
+    distinct timesteps of the same multivariate series, so kernel_size=1 is
+    equally correct and produces a faster embedding with no information loss.
 
-    For ETT datasets where channel_period=1: j // 1 == j, exact same
-    behaviour as before, no regression.
+All other classes (RotaryPositionalEmbedding, RotaryPositionalEmbeddingFixed,
+RotaryChannelEmbeddingLearnable, RotaryChannelEmbeddingFixed,
+PositionalEmbedding, FixedEmbedding, TemporalEmbedding, TimeFeatureEmbedding,
+DataEmbedding) are UNCHANGED from the latest repo.
 """
 
 import torch
@@ -64,8 +67,7 @@ def _compute_rope_embeddings(
 
 def _rotate_half_optimized(x: torch.Tensor) -> torch.Tensor:
     """
-    FSDP-safe rotate_half: uses flatten(-2) instead of .view() to avoid
-    failures on non-contiguous sharded tensors.
+    FSDP-safe rotate_half: uses flatten(-2) instead of .view().
     [x0, x1, x2, x3, ...] -> [-x1, x0, -x3, x2, ...]
     """
     x1 = x[..., ::2]
@@ -82,22 +84,11 @@ def _apply_rotary_emb(
 
 
 # =============================================================================
-# ROTARY POSITIONAL EMBEDDING — LEARNABLE  (FIX 2 applied)
+# ROTARY POSITIONAL EMBEDDING — LEARNABLE  (unchanged)
 # =============================================================================
 
 class RotaryPositionalEmbedding(nn.Module):
-    """
-    Learnable Rotary Positional Embedding with timestep-granularity indexing.
-
-    CHANGE vs original:
-        Constructor now accepts channel_period (default 1 = no change for ETT).
-        forward() looks up table row j // channel_period for window position j
-        so that all channel_period rows belonging to the same real timestep
-        receive identical positional embeddings.
-
-    WHY channel_period=1 is safe for non-restructured data:
-        j // 1 == j, so behaviour is identical to the original.
-    """
+    """Learnable Rotary Positional Embedding with timestep-granularity indexing."""
 
     def __init__(self, d_model: int, max_len: int = 200000,
                  base: float = 10000.0, channel_period: int = 1):
@@ -113,73 +104,6 @@ class RotaryPositionalEmbedding(nn.Module):
         self.cos_embed = nn.Parameter(cos_embed, requires_grad=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (B, seq_len, d_model)
-        Returns:
-            (B, seq_len, d_model) with timestep-granularity ROPE applied
-        """
-        batch, seq_len, d_model = x.size()
-
-        # Maximum table index after the fix: (seq_len-1) // channel_period
-        # Always smaller than seq_len, so any previously valid max_len
-        # is still valid. Guard updated to check actual max index.
-        max_index = (seq_len - 1) // self.channel_period
-        if max_index >= self.max_len:
-            raise ValueError(
-                f"Timestep index {max_index} >= max_len {self.max_len}. "
-                f"Increase max_len to at least {max_index + 1}."
-            )
-
-        # ── FIX 2: index by real timestep within window, not by row ─────────
-        # All channel_period rows of the same timestep get the same embedding.
-        # j // channel_period: [0,0,..,0, 1,1,..,1, 2,2,..,2, ...]
-        #                       ←c times→  ←c times→
-        timestep_indices = torch.arange(seq_len, device=x.device) // self.channel_period
-        # ─────────────────────────────────────────────────────────────────────
-
-        sin_base = self.sin_embed[timestep_indices, :]          # (seq_len, d_model/2)
-        cos_base = self.cos_embed[timestep_indices, :]
-
-        sin_embed = sin_base.unsqueeze(0).repeat_interleave(2, dim=-1)  # (1, seq_len, d_model)
-        cos_embed = cos_base.unsqueeze(0).repeat_interleave(2, dim=-1)
-
-        # DTYPE SAFETY: FSDP may shard parameters as BF16 while x is FP32
-        if sin_embed.dtype != x.dtype:
-            sin_embed = sin_embed.to(x.dtype)
-            cos_embed = cos_embed.to(x.dtype)
-
-        return _apply_rotary_emb(x, sin_embed, cos_embed)
-
-    def extra_repr(self) -> str:
-        return (f'd_model={self.d_model}, max_len={self.max_len}, '
-                f'channel_period={self.channel_period}')
-
-
-# =============================================================================
-# ROTARY POSITIONAL EMBEDDING — FIXED  (FIX 2 applied)
-# =============================================================================
-
-class RotaryPositionalEmbeddingFixed(nn.Module):
-    """
-    Fixed (non-learnable) Rotary Positional Embedding with timestep-granularity
-    indexing. Identical logic to the learnable version; sin/cos are buffers.
-    """
-
-    def __init__(self, d_model: int, max_len: int = 200000,
-                 base: float = 10000.0, channel_period: int = 1):
-        super().__init__()
-        assert d_model % 2 == 0, f"d_model must be even, got {d_model}"
-        self.d_model = d_model
-        self.max_len = max_len
-        self.base = base
-        self.channel_period = channel_period
-
-        sin_embed, cos_embed = _compute_rope_embeddings(max_len, d_model, base)
-        self.register_buffer("sin_embed", sin_embed, persistent=True)
-        self.register_buffer("cos_embed", cos_embed, persistent=True)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch, seq_len, d_model = x.size()
 
         max_index = (seq_len - 1) // self.channel_period
@@ -189,9 +113,8 @@ class RotaryPositionalEmbeddingFixed(nn.Module):
                 f"Increase max_len to at least {max_index + 1}."
             )
 
-        # ── FIX 2 ────────────────────────────────────────────────────────────
-        timestep_indices = torch.arange(seq_len, device=x.device) // self.channel_period
-        # ─────────────────────────────────────────────────────────────────────
+        timestep_indices = torch.arange(
+            seq_len, device=x.device) // self.channel_period
 
         sin_base = self.sin_embed[timestep_indices, :]
         cos_base = self.cos_embed[timestep_indices, :]
@@ -211,18 +134,61 @@ class RotaryPositionalEmbeddingFixed(nn.Module):
 
 
 # =============================================================================
-# ROTARY CHANNEL EMBEDDING — LEARNABLE  (FIX 1, unchanged from previous round)
+# ROTARY POSITIONAL EMBEDDING — FIXED  (unchanged)
+# =============================================================================
+
+class RotaryPositionalEmbeddingFixed(nn.Module):
+    """Fixed (non-learnable) Rotary Positional Embedding with timestep-granularity."""
+
+    def __init__(self, d_model: int, max_len: int = 200000,
+                 base: float = 10000.0, channel_period: int = 1):
+        super().__init__()
+        assert d_model % 2 == 0, f"d_model must be even, got {d_model}"
+        self.d_model = d_model
+        self.max_len = max_len
+        self.base = base
+        self.channel_period = channel_period
+
+        sin_embed, cos_embed = _compute_rope_embeddings(max_len, d_model, base)
+        self.register_buffer("sin_embed", sin_embed, persistent=True)
+        self.register_buffer("cos_embed", cos_embed, persistent=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, seq_len, d_model = x.size()
+
+        max_index = (seq_len - 1) // self.channel_period
+        if max_index >= self.max_len:
+            raise ValueError(
+                f"Timestep index {max_index} >= max_len {self.max_len}. "
+                f"Increase max_len to at least {max_index + 1}."
+            )
+
+        timestep_indices = torch.arange(
+            seq_len, device=x.device) // self.channel_period
+
+        sin_base = self.sin_embed[timestep_indices, :]
+        cos_base = self.cos_embed[timestep_indices, :]
+
+        sin_embed = sin_base.unsqueeze(0).repeat_interleave(2, dim=-1)
+        cos_embed = cos_base.unsqueeze(0).repeat_interleave(2, dim=-1)
+
+        if sin_embed.dtype != x.dtype:
+            sin_embed = sin_embed.to(x.dtype)
+            cos_embed = cos_embed.to(x.dtype)
+
+        return _apply_rotary_emb(x, sin_embed, cos_embed)
+
+    def extra_repr(self) -> str:
+        return (f'd_model={self.d_model}, max_len={self.max_len}, '
+                f'channel_period={self.channel_period}')
+
+
+# =============================================================================
+# ROTARY CHANNEL EMBEDDING — LEARNABLE  (unchanged)
 # =============================================================================
 
 class RotaryChannelEmbeddingLearnable(nn.Module):
-    """
-    Learnable Rotary Channel Embedding with per-sample phase correction.
-
-    forward(x, phase_offset):
-        position j of sample b receives the channel embedding for
-        (phase_offset[b] + j) % channel_period.
-        phase_offset=None falls back to all-zeros (phase 0).
-    """
+    """Learnable Rotary Channel Embedding with per-sample phase correction."""
 
     def __init__(self, c_in: int, d_model: int,
                  channel_period: int = 321, max_len: int = 2000,
@@ -235,7 +201,8 @@ class RotaryChannelEmbeddingLearnable(nn.Module):
         self.base = base
         self.max_len = max_len
 
-        sin_embed, cos_embed = _compute_rope_embeddings(channel_period, d_model, base)
+        sin_embed, cos_embed = _compute_rope_embeddings(
+            channel_period, d_model, base)
         self.sin_embed = nn.Parameter(sin_embed, requires_grad=True)
         self.cos_embed = nn.Parameter(cos_embed, requires_grad=True)
 
@@ -245,8 +212,10 @@ class RotaryChannelEmbeddingLearnable(nn.Module):
 
         if phase_offset is None:
             positions = j % self.channel_period
-            sin_e = self.sin_embed[positions].repeat_interleave(2, dim=-1).unsqueeze(0)
-            cos_e = self.cos_embed[positions].repeat_interleave(2, dim=-1).unsqueeze(0)
+            sin_e = self.sin_embed[positions].repeat_interleave(
+                2, dim=-1).unsqueeze(0)
+            cos_e = self.cos_embed[positions].repeat_interleave(
+                2, dim=-1).unsqueeze(0)
         else:
             if not isinstance(phase_offset, torch.Tensor):
                 phase_offset = torch.tensor(
@@ -256,7 +225,9 @@ class RotaryChannelEmbeddingLearnable(nn.Module):
             if phase_offset.dim() == 0:
                 phase_offset = phase_offset.unsqueeze(0).expand(batch)
 
-            positions = (phase_offset.unsqueeze(1) + j.unsqueeze(0)) % self.channel_period
+            positions = (
+                phase_offset.unsqueeze(1) + j.unsqueeze(0)
+            ) % self.channel_period
             sin_e = self.sin_embed[positions].repeat_interleave(2, dim=-1)
             cos_e = self.cos_embed[positions].repeat_interleave(2, dim=-1)
 
@@ -272,14 +243,11 @@ class RotaryChannelEmbeddingLearnable(nn.Module):
 
 
 # =============================================================================
-# ROTARY CHANNEL EMBEDDING — FIXED  (FIX 1, unchanged from previous round)
+# ROTARY CHANNEL EMBEDDING — FIXED  (unchanged)
 # =============================================================================
 
 class RotaryChannelEmbeddingFixed(nn.Module):
-    """
-    Fixed (non-learnable) Rotary Channel Embedding with per-sample phase
-    correction. Identical logic to Learnable; sin/cos are buffers.
-    """
+    """Fixed (non-learnable) Rotary Channel Embedding with per-sample phase correction."""
 
     def __init__(self, c_in: int, d_model: int,
                  channel_period: int = 321, max_len: int = 2000,
@@ -291,7 +259,8 @@ class RotaryChannelEmbeddingFixed(nn.Module):
         self.channel_period = channel_period
         self.base = base
 
-        sin_embed, cos_embed = _compute_rope_embeddings(channel_period, d_model, base)
+        sin_embed, cos_embed = _compute_rope_embeddings(
+            channel_period, d_model, base)
         self.register_buffer("sin_embed", sin_embed, persistent=True)
         self.register_buffer("cos_embed", cos_embed, persistent=True)
 
@@ -301,8 +270,10 @@ class RotaryChannelEmbeddingFixed(nn.Module):
 
         if phase_offset is None:
             positions = j % self.channel_period
-            sin_e = self.sin_embed[positions].repeat_interleave(2, dim=-1).unsqueeze(0)
-            cos_e = self.cos_embed[positions].repeat_interleave(2, dim=-1).unsqueeze(0)
+            sin_e = self.sin_embed[positions].repeat_interleave(
+                2, dim=-1).unsqueeze(0)
+            cos_e = self.cos_embed[positions].repeat_interleave(
+                2, dim=-1).unsqueeze(0)
         else:
             if not isinstance(phase_offset, torch.Tensor):
                 phase_offset = torch.tensor(
@@ -312,7 +283,9 @@ class RotaryChannelEmbeddingFixed(nn.Module):
             if phase_offset.dim() == 0:
                 phase_offset = phase_offset.unsqueeze(0).expand(batch)
 
-            positions = (phase_offset.unsqueeze(1) + j.unsqueeze(0)) % self.channel_period
+            positions = (
+                phase_offset.unsqueeze(1) + j.unsqueeze(0)
+            ) % self.channel_period
             sin_e = self.sin_embed[positions].repeat_interleave(2, dim=-1)
             cos_e = self.cos_embed[positions].repeat_interleave(2, dim=-1)
 
@@ -328,10 +301,11 @@ class RotaryChannelEmbeddingFixed(nn.Module):
 
 
 # =============================================================================
-# STANDARD EMBEDDINGS  (unchanged)
+# STANDARD EMBEDDINGS
 # =============================================================================
 
 class PositionalEmbedding(nn.Module):
+    """Unchanged."""
     def __init__(self, d_model: int, max_len: int = 200000):
         super().__init__()
         pe = torch.zeros(max_len, d_model, dtype=torch.float32)
@@ -350,12 +324,25 @@ class PositionalEmbedding(nn.Module):
 
 
 class TokenEmbedding(nn.Module):
+    """
+    Token Embedding: projects c_in features to d_model dimensions.
+
+    CHANGE: kernel_size=3, padding=1, padding_mode='circular'
+         -> kernel_size=1, padding=0
+
+    kernel_size=1 is a pointwise independent projection per sequence position.
+    No cross-position mixing. All inter-position interactions handled by
+    subsequent attention and channel mixing layers.
+    """
     def __init__(self, c_in: int, d_model: int):
         super().__init__()
-        padding = 1 if torch.__version__ >= '1.5.0' else 2
+        # CHANGE: kernel_size=1, padding=0 — pointwise independent projection
+        # Removed: kernel_size=3, padding=1, padding_mode='circular'
         self.tokenConv = nn.Conv1d(
-            in_channels=c_in, out_channels=d_model,
-            kernel_size=3, padding=padding, padding_mode='circular'
+            in_channels=c_in,
+            out_channels=d_model,
+            kernel_size=1,
+            padding=0
         )
         for m in self.modules():
             if isinstance(m, nn.Conv1d):
@@ -367,6 +354,7 @@ class TokenEmbedding(nn.Module):
 
 
 class FixedEmbedding(nn.Module):
+    """Unchanged."""
     def __init__(self, c_in: int, d_model: int):
         super().__init__()
         w = torch.zeros(c_in, d_model, dtype=torch.float32)
@@ -385,6 +373,7 @@ class FixedEmbedding(nn.Module):
 
 
 class TemporalEmbedding(nn.Module):
+    """Unchanged."""
     def __init__(self, d_model: int, embed_type: str = 'fixed', freq: str = 'h'):
         super().__init__()
         minute_size, hour_size, weekday_size, day_size, month_size = 4, 24, 7, 32, 13
@@ -398,7 +387,8 @@ class TemporalEmbedding(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.long()
-        minute_x = self.minute_embed(x[:, :, 4]) if hasattr(self, 'minute_embed') else 0.
+        minute_x = (self.minute_embed(x[:, :, 4])
+                    if hasattr(self, 'minute_embed') else 0.)
         hour_x = self.hour_embed(x[:, :, 3])
         weekday_x = self.weekday_embed(x[:, :, 2])
         day_x = self.day_embed(x[:, :, 1])
@@ -407,6 +397,7 @@ class TemporalEmbedding(nn.Module):
 
 
 class TimeFeatureEmbedding(nn.Module):
+    """Unchanged."""
     def __init__(self, d_model: int, embed_type: str = 'timeF', freq: str = 'h'):
         super().__init__()
         freq_map = {'h': 4, 't': 5, 's': 6, 'm': 1, 'a': 1, 'w': 2, 'd': 3, 'b': 3}
@@ -418,21 +409,17 @@ class TimeFeatureEmbedding(nn.Module):
 
 
 # =============================================================================
-# MAIN DATA EMBEDDING  (channel_period now forwarded to positional embeddings)
+# MAIN DATA EMBEDDING  (unchanged)
 # =============================================================================
 
 class DataEmbedding(nn.Module):
     """
-    Combined Data Embedding with phase-corrected channel ROPE and
-    timestep-granularity positional ROPE.
+    Combined Data Embedding. Unchanged from latest repo.
 
-    CHANGES vs previous round:
-        rpe and rpe_fixed now receive channel_period so that forward()
-        indexes the sin/cos table by j // channel_period rather than j.
-        DataEmbedding already stored self.channel_period; it is now also
-        forwarded to the positional embedding constructors.
-
-    All other logic unchanged from the previous channel-phase-correction round.
+    The TokenEmbedding it uses now has kernel_size=1, but DataEmbedding
+    itself has no changes. The rest of the pipeline (positional ROPE indexed
+    by j//channel_period, channel ROPE indexed by (phase_offset+j)%cp) is
+    identical to the latest repo.
     """
 
     def __init__(self, c_in: int, d_model: int,
@@ -444,8 +431,10 @@ class DataEmbedding(nn.Module):
         self.d_model = d_model
         self.channel_period = channel_period
 
+        # TokenEmbedding now uses kernel_size=1
         self.value_embedding = TokenEmbedding(c_in=c_in, d_model=d_model)
-        self.position_embedding = PositionalEmbedding(d_model=d_model, max_len=max_len)
+        self.position_embedding = PositionalEmbedding(
+            d_model=d_model, max_len=max_len)
 
         if embed_type != 'timeF':
             self.temporal_embedding = TemporalEmbedding(
@@ -454,12 +443,10 @@ class DataEmbedding(nn.Module):
             self.temporal_embedding = TimeFeatureEmbedding(
                 d_model=d_model, embed_type=embed_type, freq=freq)
 
-        # ── FIX 2: pass channel_period to both positional embeddings ─────────
         self.rpe = RotaryPositionalEmbedding(
             d_model=d_model, max_len=max_len, channel_period=channel_period)
         self.rpe_fixed = RotaryPositionalEmbeddingFixed(
             d_model=d_model, max_len=max_len, channel_period=channel_period)
-        # ─────────────────────────────────────────────────────────────────────
 
         self.fixed_channel_embedding = RotaryChannelEmbeddingFixed(
             c_in=c_in, d_model=d_model, channel_period=channel_period)
@@ -470,29 +457,8 @@ class DataEmbedding(nn.Module):
 
     def forward(self, x: torch.Tensor, x_mark: torch.Tensor,
                 phase_offset=None) -> torch.Tensor:
-        """
-        Args:
-            x:            (B, seq_len, c_in)
-            x_mark:       (B, seq_len, time_features) — kept for API compat,
-                          not used in ROPE mode (same as original)
-            phase_offset: None | int | (B,) LongTensor
-                          Channel phase for this batch window.
-
-        Embedding pipeline:
-            1. TokenEmbedding: project c_in -> d_model
-            2. rpe + rpe_fixed: positional ROPE indexed by j // channel_period
-               → all channels at the same real timestep get identical pos emb
-            3. channel fixed + channel learnable: ROPE indexed by
-               (phase_offset + j) % channel_period
-               → each position correctly identifies which channel it is
-        """
         x = self.value_embedding(x)
-
-        # Step 2: positional ROPE — timestep granularity (FIX 2)
         x = self.rpe(x) + self.rpe_fixed(x)
-
-        # Step 3: channel ROPE — phase-corrected (FIX 1)
         x = (self.fixed_channel_embedding(x, phase_offset) +
              self.learnable_channel_embedding(x, phase_offset))
-
         return self.dropout(x)
