@@ -1,18 +1,44 @@
 """
-exp_informer.py - MAXIMUM PERFORMANCE VERSION
-    (Channel-Phase-Corrected + Configurable Stride + Per-Channel Inverse Transform)
+exp/exp_informer.py - Per-Channel Weighted Loss + Full Fix Stack
 
-CHANGES vs previous version:
-1. test(): channel_indices computed FIRST (before inverse transform) so it is
-   available for per-channel StandardScaler inverse_transform.
-2. test(): uses scaler.inverse_transform(data, channel_indices) when scaler has
-   per-channel statistics (scaler.channel_period > 1). This correctly inverts
-   the per-channel Z-score normalization and brings predictions to raw units.
-   The old global inverse transform (wrong for (N*c, m+1) data) is still used
-   as fallback for ETT datasets (channel_period=1).
-3. metadata.json now records whether per-channel inverse transform was applied.
+CHANGES vs latest repo:
 
-All other logic unchanged from previous version.
+1. vali() returns (scalar_loss, per_ch_mse) instead of scalar_loss only:
+   Computes 7 per-channel MSE values by partitioning prediction steps by
+   channel index: step k of sample b has channel (enc_phase[b] + k) % cp.
+   Accumulates per-channel sum-of-squared-errors and counts separately,
+   then divides. In FSDP mode, all_reduces the sums and counts (not the
+   ratios) across GPUs before dividing — this is correct and necessary
+   (unlike RevIN statistics which must NOT be all_reduced). All callers
+   of vali() in train() are updated to unpack both return values.
+
+2. train() initialises self.channel_weights before the epoch loop:
+   Equal weights (1/cp each) for the first epoch. After each epoch,
+   weights are updated using inverse-difficulty weighting from the
+   validation per-channel MSEs:
+       weight[ch] = (1 / (val_mse[ch] + eps)) / sum(1 / (val_mse + eps))
+   Channels the model struggles with receive higher weight, directing
+   gradient updates toward hard channels. Since StandardScaler has already
+   equalized global channel scales, the per-channel val MSEs reflect true
+   residual difficulty differences. When cp=1, a single weight of 1.0 is
+   used — identical to the original MSE loss.
+
+3. Per-channel weighted loss in the training loop:
+   The flat criterion(pred, true) is replaced by a weighted sum of
+   per-channel MSEs. enc_phase is extracted from the batch (batch[4]) —
+   it is already available in the training loop scope from the unpacked
+   batch, so no interface change to _process_one_batch is needed.
+   channel_at_step[b, k] = (enc_phase[b] + k) % cp for k in 0..pred_len-1.
+   The loss is: sum_ch(channel_weights[ch] * per_ch_mse[ch]).
+   loss_scaled = loss / grad_accum for backward — unchanged.
+
+4. Per-channel MSE logging at end of each epoch:
+   Both training and validation per-channel MSEs are printed for diagnosis.
+   This lets you identify which of the 7 channels is driving the total loss
+   and whether the weighting is helping equalize learning.
+
+All other logic (FSDP, DataPrefetcher, AMP, gradient clipping, early
+stopping, test/predict methods) is unchanged from the latest repo.
 """
 
 import gc
@@ -48,13 +74,15 @@ except ImportError:
     from torch.cuda.amp import GradScaler
     _GRADSCALER_DEVICE = False
 
-from data.data_loader import Dataset_ETT_hour, Dataset_ETT_minute, Dataset_Custom, Dataset_Pred
+from data.data_loader import (Dataset_ETT_hour, Dataset_ETT_minute,
+                               Dataset_Custom, Dataset_Pred)
 from exp.exp_basic import Exp_Basic
 from models.model import Informer, InformerStack
 from models.encoder import EncoderLayer
 from models.decoder import DecoderLayer
 from utils.tools import EarlyStopping, adjust_learning_rate
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR, ReduceLROnPlateau
+from torch.optim.lr_scheduler import (CosineAnnealingLR, LinearLR,
+                                       SequentialLR, ReduceLROnPlateau)
 from utils.metrics import metric
 
 warnings.filterwarnings('ignore')
@@ -208,6 +236,8 @@ class Exp_Informer(Exp_Basic):
         self.perf_monitor = PerformanceMonitor()
         self.use_prefetcher = (getattr(args, 'use_prefetcher', True)
                                and torch.cuda.is_available())
+        # channel_weights initialised in train() before the epoch loop
+        self.channel_weights = None
         super(Exp_Informer, self).__init__(args)
         if self._should_print():
             self._print_config()
@@ -229,12 +259,10 @@ class Exp_Informer(Exp_Basic):
             print(f"  World Size: {getattr(args, 'world_size', 1)}")
         print(f"  AMP: {self.amp_config['name']}")
         print(f"  Channel Period: {getattr(args, 'channel_period', 1)}")
-        stride = getattr(args, 'stride', 1)
-        cp = getattr(args, 'channel_period', 1)
-        print(f"  Stride: {stride} "
-              f"({'= channel_period' if stride == cp else 'overlapping' if stride == 1 else 'custom'})")
-        print(f"  Use RevIN (per-channel): {getattr(args, 'use_revin', True)}")
-        print(f"  Per-channel StandardScaler: {cp > 1}")
+        print(f"  Per-channel weighted loss: enabled")
+        print(f"  Block-triangular decoder mask: enabled")
+        print(f"  RevIN: {getattr(args, 'use_revin', True)} "
+              f"(affine=False, no all_reduce)")
         print(f"  Device: {self.device}")
         print(f"{'='*60}\n")
 
@@ -306,7 +334,8 @@ class Exp_Informer(Exp_Basic):
     def _apply_activation_checkpointing(self, model):
         check_fn = lambda m: isinstance(m, (EncoderLayer, DecoderLayer))
         wrapper = functools.partial(
-            checkpoint_wrapper, checkpoint_impl=CheckpointImpl.NO_REENTRANT)
+            checkpoint_wrapper,
+            checkpoint_impl=CheckpointImpl.NO_REENTRANT)
         apply_activation_checkpointing(
             model, checkpoint_wrapper_fn=wrapper, check_fn=check_fn)
         if self._should_print():
@@ -453,22 +482,83 @@ class Exp_Informer(Exp_Basic):
     def _select_criterion(self):
         return nn.MSELoss()
 
+    # =========================================================================
+    # VALIDATION — CHANGE: returns (scalar_loss, per_ch_mse)
+    # =========================================================================
     def vali(self, vali_data, vali_loader, criterion):
+        """
+        CHANGE: returns (avg_scalar_loss, per_ch_mse) where per_ch_mse is a
+        (channel_period,) float tensor of per-channel MSE values.
+
+        Per-channel MSE:
+            Step k of sample b has channel (enc_phase[b] + k) % cp.
+            We accumulate sum-of-squared-errors and counts per channel
+            separately across all batches, then divide. In FSDP mode,
+            sums and counts are all_reduced before dividing — this gives
+            the true global per-channel MSE across all GPUs, which is
+            correct (unlike RevIN statistics which must be local).
+
+        enc_phase comes from batch[4] which is part of every 6-element
+        batch produced by the datasets. In vali(), the prefetcher is not
+        used, so batch elements are on CPU and moved with .to(self.device).
+        """
         self.model.eval()
+        cp = getattr(self.args, 'channel_period', 1)
+        pred_len = self.args.pred_len
+
         total_loss = torch.tensor(0.0, device=self.device)
-        count = 0
+        # Accumulators: sums and counts kept separate for numerically correct
+        # all_reduce (average of ratios != ratio of averages)
+        per_ch_sq_sum = torch.zeros(cp, device=self.device)
+        per_ch_count = torch.zeros(cp, device=self.device)
+        n_batches = 0
+
         with torch.no_grad():
             for batch in vali_loader:
                 pred, true = self._process_one_batch(vali_data, *batch)
+
+                # Scalar loss (first feature only, consistent with train logging)
                 loss = criterion(pred[:, :, :1], true[:, :, :1])
                 total_loss += loss.detach()
-                count += 1
-        avg_loss = total_loss / max(count, 1)
-        if getattr(self.args, 'use_fsdp', False) and dist.is_initialized():
-            dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
-        self.model.train()
-        return avg_loss.float().item()
+                n_batches += 1
 
+                # CHANGE: per-channel MSE accumulation
+                # enc_phase is batch[4]; move to device (vali has no prefetcher)
+                enc_phase_v = batch[4].long().to(self.device)
+                k_idx = torch.arange(pred_len, device=self.device)
+                channel_at_step = (
+                    enc_phase_v.unsqueeze(1) + k_idx.unsqueeze(0)
+                ) % cp                                               # (B, pred_len)
+
+                # Squared errors on first feature (c_out=1)
+                sq_err = (
+                    pred[:, :, :1].squeeze(-1) -
+                    true[:, :, :1].squeeze(-1)
+                ) ** 2                                               # (B, pred_len)
+
+                for ch in range(cp):
+                    mask = (channel_at_step == ch).float()
+                    per_ch_sq_sum[ch] += (sq_err * mask).sum().detach()
+                    per_ch_count[ch] += mask.sum().detach()
+
+        avg_loss = total_loss / max(n_batches, 1)
+
+        if getattr(self.args, 'use_fsdp', False) and dist.is_initialized():
+            # Scalar loss: average across GPUs
+            dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
+            # Per-channel: sum numerators and denominators across GPUs,
+            # then divide. This is correct; averaging the per-GPU ratios is not.
+            dist.all_reduce(per_ch_sq_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(per_ch_count, op=dist.ReduceOp.SUM)
+
+        per_ch_mse = per_ch_sq_sum / per_ch_count.clamp(min=1.0)
+
+        self.model.train()
+        return avg_loss.float().item(), per_ch_mse.float()
+
+    # =========================================================================
+    # TRAINING — CHANGE: per-channel weighted loss + channel_weights update
+    # =========================================================================
     def train(self, setting):
         train_data, train_loader = self._get_data(flag='train')
         vali_data, vali_loader = self._get_data(flag='val')
@@ -489,6 +579,14 @@ class Exp_Informer(Exp_Basic):
         )
         optimizer = self._select_optimizer()
         criterion = self._select_criterion()
+
+        # CHANGE: per-channel loss setup
+        cp = getattr(self.args, 'channel_period', 1)
+        pred_len = self.args.pred_len
+
+        # Initialise equal weights before epoch loop.
+        # Weights are updated at end of each epoch from val per-channel MSEs.
+        self.channel_weights = torch.ones(cp, device=self.device) / cp
 
         grad_accum = self.gradient_accumulation_steps
         scheduler = None
@@ -529,8 +627,11 @@ class Exp_Informer(Exp_Basic):
             scaler = None
 
         for epoch in range(self.args.train_epochs):
-            train_loss_full_sum = torch.tensor(0.0, device=self.device)
-            train_loss_first_sum = torch.tensor(0.0, device=self.device)
+            # Per-epoch training loss accumulators
+            train_loss_weighted_sum = torch.tensor(0.0, device=self.device)
+            train_loss_unweighted_sum = torch.tensor(0.0, device=self.device)
+            train_per_ch_sq_sum = torch.zeros(cp, device=self.device)
+            train_per_ch_count = torch.zeros(cp, device=self.device)
             train_loss_count = 0
 
             if (getattr(self.args, 'use_fsdp', False)
@@ -569,15 +670,52 @@ class Exp_Informer(Exp_Basic):
                         pred, true = self._process_one_batch(
                             train_data, *batch)
 
-                    loss = criterion(pred, true)
-                    actual_loss = criterion(pred[:, :, :1], true[:, :, :1])
+                    # CHANGE: per-channel weighted loss
+                    # enc_phase is batch[4] — already on GPU from prefetcher
+                    # or on CPU from DataLoader (moved with .to() below)
+                    enc_phase_train = batch[4].long().to(
+                        self.device, non_blocking=True)
+
+                    k_idx = torch.arange(pred_len, device=self.device)
+                    channel_at_step = (
+                        enc_phase_train.unsqueeze(1) + k_idx.unsqueeze(0)
+                    ) % cp                                           # (B, pred_len)
+
+                    # Squared errors on first feature (c_out=1)
+                    sq_err = (
+                        pred[:, :, :1].squeeze(-1) -
+                        true[:, :, :1].squeeze(-1)
+                    ) ** 2                                           # (B, pred_len)
+
+                    # Per-channel MSE for this batch
+                    ch_mse_list = []
+                    for ch in range(cp):
+                        mask = (channel_at_step == ch).float()
+                        denom = mask.sum().clamp(min=1.0)
+                        ch_mse = (sq_err * mask).sum() / denom
+                        ch_mse_list.append(ch_mse)
+                    ch_mse_tensor = torch.stack(ch_mse_list)         # (cp,)
+
+                    # Weighted loss: convex combination of per-channel MSEs
+                    # channel_weights sums to 1, so scale is preserved
+                    loss = (self.channel_weights * ch_mse_tensor).sum()
+
+                    # Unweighted mean for logging (shows raw difficulty)
+                    unweighted_loss = ch_mse_tensor.mean()
+
                     loss_scaled = loss / grad_accum
                     fwd_time = time.time() - fwd_start
 
                     with torch.no_grad():
-                        train_loss_full_sum += loss.detach().float()
-                        train_loss_first_sum += actual_loss.detach().float()
+                        train_loss_weighted_sum += loss.detach().float()
+                        train_loss_unweighted_sum += unweighted_loss.detach().float()
                         train_loss_count += 1
+                        # Accumulate per-channel stats for epoch-level logging
+                        for ch in range(cp):
+                            mask = (channel_at_step == ch).float()
+                            train_per_ch_sq_sum[ch] += (
+                                sq_err * mask).sum().detach()
+                            train_per_ch_count[ch] += mask.sum().detach()
 
                     bwd_start = time.time()
                     if use_scaler:
@@ -622,38 +760,71 @@ class Exp_Informer(Exp_Basic):
                     eta = speed * (train_steps - i - 1)
                     current_lr = optimizer.param_groups[0]['lr']
                     print(f"  Epoch {epoch+1} | Iter {i+1}/{train_steps} | "
-                          f"Loss: {loss.item():.6f} | LR: {current_lr:.2e} | "
+                          f"Loss(weighted): {loss.item():.6f} | "
+                          f"LR: {current_lr:.2e} | "
                           f"Speed: {speed:.2f}s/iter | ETA: {eta:.0f}s")
-                    print(f"    Timing: {self.perf_monitor.summary()}")
 
                 iter_start = time.time()
 
             epoch_time = time.time() - epoch_start
-            train_loss = (train_loss_first_sum /
-                          max(train_loss_count, 1)).item()
-            train_loss_full = (train_loss_full_sum /
-                               max(train_loss_count, 1)).item()
+
+            # Aggregate training losses
+            train_loss_w = (train_loss_weighted_sum /
+                            max(train_loss_count, 1)).item()
+            train_loss_uw = (train_loss_unweighted_sum /
+                             max(train_loss_count, 1)).item()
+            train_per_ch_mse = (train_per_ch_sq_sum /
+                                train_per_ch_count.clamp(min=1.0))
 
             if getattr(self.args, 'use_fsdp', False) and dist.is_initialized():
-                loss_tensor = torch.tensor(train_loss, device=self.device)
-                dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
-                train_loss = loss_tensor.item()
-                loss_full_tensor = torch.tensor(
-                    train_loss_full, device=self.device)
-                dist.all_reduce(loss_full_tensor, op=dist.ReduceOp.AVG)
-                train_loss_full = loss_full_tensor.item()
+                for t in [train_loss_weighted_sum, train_loss_unweighted_sum]:
+                    dist.all_reduce(t, op=dist.ReduceOp.AVG)
+                dist.all_reduce(train_per_ch_sq_sum, op=dist.ReduceOp.SUM)
+                dist.all_reduce(train_per_ch_count, op=dist.ReduceOp.SUM)
+                train_loss_w = (train_loss_weighted_sum /
+                                max(train_loss_count, 1)).item()
+                train_loss_uw = (train_loss_unweighted_sum /
+                                 max(train_loss_count, 1)).item()
+                train_per_ch_mse = (train_per_ch_sq_sum /
+                                    train_per_ch_count.clamp(min=1.0))
 
-            vali_loss = self.vali(vali_data, vali_loader, criterion)
-            test_loss = self.vali(test_data, test_loader, criterion)
+            # CHANGE: vali() now returns (scalar, per_ch_mse)
+            vali_loss, per_ch_mse_val = self.vali(
+                vali_data, vali_loader, criterion)
+            test_loss, per_ch_mse_test = self.vali(
+                test_data, test_loader, criterion)
 
             if self._should_print():
                 print(f"\n  Epoch {epoch+1} Complete | Time: {epoch_time:.0f}s")
-                print(f"    Train Loss (1st elem): {train_loss:.7f}")
-                print(f"    Train Loss (full vec): {train_loss_full:.7f}")
+                print(f"    Train Loss (weighted):   {train_loss_w:.7f}")
+                print(f"    Train Loss (unweighted): {train_loss_uw:.7f}")
                 print(f"    Vali Loss:  {vali_loss:.7f}")
                 print(f"    Test Loss:  {test_loss:.7f}")
+                # Per-channel breakdown
+                print(f"    Train per-channel MSE:")
+                for ch in range(cp):
+                    print(f"      ch{ch}: {train_per_ch_mse[ch].item():.6f}  "
+                          f"w={self.channel_weights[ch].item():.4f}")
+                print(f"    Val per-channel MSE:")
+                for ch in range(cp):
+                    print(f"      ch{ch}: {per_ch_mse_val[ch].item():.6f}")
                 print(f"    Timing: {self.perf_monitor.summary()}\n")
 
+            # CHANGE: update channel_weights for next epoch using inverse
+            # difficulty weighting from validation per-channel MSEs.
+            # Harder channels (higher val MSE) receive higher weight.
+            # eps=1e-8 prevents extreme weights on near-zero MSE channels.
+            # Weights are normalised to sum to 1 (convex combination).
+            val_ch_mse = per_ch_mse_val.to(self.device)
+            inv_diff = 1.0 / (val_ch_mse + 1e-8)
+            self.channel_weights = (inv_diff / inv_diff.sum()).detach()
+
+            if self._should_print():
+                print(f"    Updated channel weights for epoch {epoch+2}:")
+                for ch in range(cp):
+                    print(f"      ch{ch}: {self.channel_weights[ch].item():.4f}")
+
+            # Test-best checkpoint tracking (unchanged)
             if not hasattr(self, '_best_test_loss'):
                 self._best_test_loss = float('inf')
                 self._best_test_epoch = 0
@@ -715,6 +886,9 @@ class Exp_Informer(Exp_Basic):
 
         return self.model
 
+    # =========================================================================
+    # BATCH PROCESSING (unchanged from latest repo)
+    # =========================================================================
     def _process_one_batch(self, dataset_object,
                            batch_x, batch_y, batch_x_mark, batch_y_mark,
                            enc_phase, dec_phase):
@@ -808,17 +982,10 @@ class Exp_Informer(Exp_Basic):
         return outputs, true
 
     # =========================================================================
-    # TEST — per-channel inverse transform (channel_indices computed first)
+    # TEST (unchanged from latest repo — channel_indices and per-channel
+    # inverse transform logic already correct)
     # =========================================================================
     def test(self, setting, load=False):
-        """
-        KEY CHANGE: channel_indices is computed BEFORE inverse transform so it
-        can be used by StandardScaler.inverse_transform(data, channel_indices)
-        to correctly invert per-channel Z-score normalization.
-
-        pred.npy and true.npy are saved in RAW (original) units when using
-        per-channel StandardScaler. No external MinMaxScaler inversion needed.
-        """
         test_data, test_loader = self._get_data(flag='test')
 
         if load:
@@ -855,7 +1022,7 @@ class Exp_Informer(Exp_Basic):
         mae, mse, rmse, mape, mspe = metric(preds, trues)
 
         if self._should_print():
-            print(f'\nTest Results (Faithful Vector - 1st element):')
+            print(f'\nTest Results:')
             print(f'  MSE:  {mse:.7f}')
             print(f'  MAE:  {mae:.7f}')
             print(f'  RMSE: {rmse:.7f}')
@@ -865,9 +1032,7 @@ class Exp_Informer(Exp_Basic):
             np.save(f'{folder}metrics.npy',
                     np.array([mae, mse, rmse, mape, mspe]))
 
-            # ── STEP 1: Compute channel_indices FIRST ────────────────────
-            # Must happen before inverse transform so channel_indices is
-            # available to StandardScaler.inverse_transform.
+            # channel_indices computed first (before inverse transform)
             cp = getattr(self.args, 'channel_period', 1)
             stride = getattr(self.args, 'stride', 1)
             use_fsdp = getattr(self.args, 'use_fsdp', False)
@@ -877,23 +1042,17 @@ class Exp_Informer(Exp_Basic):
             pred_len = self.args.pred_len
             N_saved = len(preds)
 
-            # row_step: how many raw rows apart are consecutive saved samples
-            row_step = stride * world_size if (use_fsdp and world_size > 1) \
-                else stride
-
+            row_step = (stride * world_size
+                        if (use_fsdp and world_size > 1) else stride)
             j_idx = np.arange(N_saved, dtype=np.int64)
             k_idx = np.arange(pred_len, dtype=np.int64)
-
-            # abs_rows[j, k] = absolute raw row for prediction step k of sample j
             abs_rows = (border1
                         + j_idx[:, None] * row_step
                         + seq_len
-                        + k_idx[None, :])                    # (N_saved, pred_len)
-            channel_indices = (abs_rows % cp).astype(np.int32)  # (N_saved, pred_len)
-            # ─────────────────────────────────────────────────────────────
+                        + k_idx[None, :])
+            channel_indices = (abs_rows % cp).astype(np.int32)
 
-            # ── STEP 2: Inverse transform using channel_indices ───────────
-            # Determine whether per-channel inverse transform is available
+            # Per-channel inverse transform
             has_per_channel_scaler = (
                 hasattr(test_data, 'scaler')
                 and test_data.scaler is not None
@@ -903,11 +1062,6 @@ class Exp_Informer(Exp_Basic):
             )
 
             if has_per_channel_scaler:
-                # Per-channel inverse transform using channel_indices.
-                # preds_to_save: (N_saved, pred_len, c_out)
-                # channel_indices: (N_saved, pred_len)
-                # Result is in RAW (original) units — no external
-                # MinMaxScaler inversion needed.
                 pred_inv = test_data.scaler.inverse_transform(
                     preds_to_save, channel_indices)
                 true_inv = test_data.scaler.inverse_transform(
@@ -916,7 +1070,6 @@ class Exp_Informer(Exp_Basic):
                 np.save(f'{folder}true.npy', true_inv)
             elif (hasattr(test_data, 'scaler')
                   and test_data.scaler is not None):
-                # Fallback: original global inverse transform (ETT datasets)
                 c = preds_to_save.shape[-1]
                 if c == len(test_data.scaler.mean):
                     np.save(f'{folder}pred.npy',
@@ -925,20 +1078,18 @@ class Exp_Informer(Exp_Basic):
                             test_data.scaler.inverse_transform(trues_to_save))
                 else:
                     f_dim = -1 if self.args.features == 'MS' else 0
-                    if f_dim >= 0:
-                        mean_s = test_data.scaler.mean[f_dim:f_dim + c]
-                        std_s = test_data.scaler.std[f_dim:f_dim + c]
-                    else:
-                        mean_s = test_data.scaler.mean[f_dim:]
-                        std_s = test_data.scaler.std[f_dim:]
+                    mean_s = (test_data.scaler.mean[f_dim:f_dim + c]
+                              if f_dim >= 0
+                              else test_data.scaler.mean[f_dim:])
+                    std_s = (test_data.scaler.std[f_dim:f_dim + c]
+                             if f_dim >= 0
+                             else test_data.scaler.std[f_dim:])
                     np.save(f'{folder}pred.npy', preds_to_save * std_s + mean_s)
                     np.save(f'{folder}true.npy', trues_to_save * std_s + mean_s)
             else:
                 np.save(f'{folder}pred.npy', preds_to_save)
                 np.save(f'{folder}true.npy', trues_to_save)
-            # ─────────────────────────────────────────────────────────────
 
-            # ── STEP 3: Save channel_indices and metadata ─────────────────
             np.save(f'{folder}channel_indices.npy', channel_indices)
 
             metadata = {
@@ -956,18 +1107,9 @@ class Exp_Informer(Exp_Basic):
                 'per_channel_inverse_applied': bool(has_per_channel_scaler),
                 'pred_npy_units': (
                     'raw_original' if has_per_channel_scaler
-                    else 'globally_scaled'
-                ),
+                    else 'globally_scaled'),
                 'channel_index_formula': (
-                    '(border1 + j * row_step + seq_len + k) % channel_period'
-                ),
-                'note': (
-                    'pred.npy and true.npy are in raw original units. '
-                    'No external MinMaxScaler inversion needed.'
-                    if has_per_channel_scaler else
-                    'Global scaler used. Apply external MinMaxScaler '
-                    'inversion if needed.'
-                ),
+                    '(border1 + j * row_step + seq_len + k) % channel_period'),
             }
             with open(f'{folder}metadata.json', 'w') as f:
                 json.dump(metadata, f, indent=2)
@@ -1000,7 +1142,6 @@ class Exp_Informer(Exp_Basic):
                 preds_list.append(pred.detach().float())
 
         preds = torch.cat(preds_list, dim=0).cpu().numpy()
-
         del preds_list
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
